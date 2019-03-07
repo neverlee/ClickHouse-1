@@ -64,22 +64,35 @@ void GroupingAggregatedTransform::pushData(Chunks chunks, Int32 bucket, bool is_
 
 bool GroupingAggregatedTransform::tryPushTwoLevelData()
 {
-    for (; next_bucket_to_push < current_bucket || (all_inputs_finished && chunks.empty()); ++next_bucket_to_push)
+    auto try_push_by_iter = [&](auto batch_it)
     {
-        auto batch_it = chunks.find(next_bucket_to_push);
         if (batch_it == chunks.end())
-            continue;
+            return false;
 
         Chunks & cur_chunks = batch_it->second;
         if (cur_chunks.empty())
         {
             chunks.erase(batch_it);
-            continue;
+            return false;
         }
 
         pushData(std::move(cur_chunks), current_bucket, false);
         chunks.erase(batch_it);
         return true;
+    };
+
+    if (all_inputs_finished)
+    {
+        /// Chunks are sorted by bucket.
+        while (!chunks.empty())
+            if (try_push_by_iter(chunks.begin()))
+                return true;
+    }
+    else
+    {
+        for (; next_bucket_to_push < current_bucket; ++next_bucket_to_push)
+            if (try_push_by_iter(chunks.find(next_bucket_to_push)))
+                return true;
     }
 
     return false;
@@ -198,20 +211,31 @@ IProcessor::Status GroupingAggregatedTransform::prepare()
             return Status::NeedData;
     }
 
-    /// We have read some data. Now try to push something again.
-    if (!pushed_to_output)
+    if (pushed_to_output)
+        return Status::PortFull;
+
+    if (has_two_level)
     {
-        if (has_two_level)
-            pushed_to_output = tryPushTwoLevelData();
-        else
-            pushed_to_output = tryPushSingleLevelData();
+        if (tryPushTwoLevelData())
+            return Status::PortFull;
+
+        /// Sanity check. If new bucket was read, we should be able to push it.
+        if (!all_inputs_finished)
+            throw Exception("GroupingAggregatedTransform has read new two-level bucket, but couldn't push it.",
+                            ErrorCodes::LOGICAL_ERROR);
+    }
+    else
+    {
+        if (!all_inputs_finished)
+            throw Exception("GroupingAggregatedTransform should have read all chunks for single level aggregation, "
+                            "but not all of the inputs are finished.", ErrorCodes::LOGICAL_ERROR);
+
+        if (tryPushSingleLevelData())
+            return Status::PortFull;
     }
 
     /// If we haven't pushed to output, then all data was read. Push overflows if have.
-    if (!pushed_to_output)
-        pushed_to_output = tryPushOverflowData();
-
-    if (pushed_to_output)
+    if (tryPushOverflowData())
         return Status::PortFull;
 
     output.finish();
@@ -292,8 +316,118 @@ SortingAggregatedTransform::SortingAggregatedTransform(size_t num_inputs, Aggreg
     : IProcessor(InputPorts(num_inputs, params->getHeader()), {params->getHeader()})
     , num_inputs(num_inputs)
     , params(std::move(params))
+    , last_bucket_number(num_inputs, -1)
 {
+}
 
+bool SortingAggregatedTransform::tryPushChunk()
+{
+    auto & output = outputs.front();
+
+    UInt32 min_bucket = last_bucket_number[0];
+    for (auto & bucket : last_bucket_number)
+        min_bucket = std::min<UInt32>(min_bucket, bucket);
+
+    auto it = chunks.find(min_bucket);
+    if (it != chunks.end())
+    {
+        output.push(std::move(it->second));
+        return true;
+    }
+
+    return false;
+}
+
+void SortingAggregatedTransform::addChunk(Chunk chunk)
+{
+    auto & info = chunk.getChunkInfo();
+    if (!info)
+        throw Exception("Chunk info was not set for chunk in GroupingAggregatedTransform.", ErrorCodes::LOGICAL_ERROR);
+
+    auto * agg_info = typeid_cast<const AggregatedChunkInfo *>(info.get());
+    if (!agg_info)
+        throw Exception("Chunk should have AggregatedChunkInfo in GroupingAggregatedTransform.", ErrorCodes::LOGICAL_ERROR);
+
+    Int32 bucket = agg_info->bucket_num;
+    bool is_overflows = agg_info->is_overflows;
+
+    if (is_overflows)
+        overflow_chunk = std::move(chunk);
+    else
+        chunks[bucket] = std::move(chunk);
+}
+
+IProcessor::Status SortingAggregatedTransform::prepare()
+{
+    /// Check can output.
+    auto & output = outputs.front();
+
+    if (output.isFinished())
+    {
+        for (auto & input : inputs)
+            input.close();
+
+        chunks.clear();
+        last_bucket_number.clear();
+        return Status::Finished;
+    }
+
+    /// Check can push (to avoid data caching).
+    if (!output.canPush())
+    {
+        for (auto & input : inputs)
+            input.setNotNeeded();
+
+        return Status::PortFull;
+    }
+
+    /// Push if have min version.
+    bool pushed_to_output = tryPushChunk();
+
+    bool need_data = false;
+    bool all_finished = true;
+
+    /// Try read anything.
+    auto in = inputs.begin();
+    for (size_t input_num = 0; input_num < num_inputs; ++input_num, ++in)
+    {
+        if (in->isFinished())
+            continue;
+
+        all_finished = false;
+
+        in->setNeeded();
+
+        if (!in->hasData())
+        {
+            need_data = true;
+            continue;
+        }
+
+        auto chunk = in->pull();
+        addChunk(std::move(chunk));
+    }
+
+    if (pushed_to_output)
+        return Status::PortFull;
+
+    if (tryPushChunk())
+        return Status::PortFull;
+
+    if (need_data)
+        return Status::NeedData;
+
+    if (!all_finished)
+        throw Exception("SortingAggregatedTransform has read bucket, but couldn't push it.",
+                  ErrorCodes::LOGICAL_ERROR);
+
+    if (overflow_chunk)
+    {
+        output.push(std::move(overflow_chunk));
+        return Status::PortFull;
+    }
+
+    return Status::Finished;
 }
 
 }

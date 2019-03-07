@@ -70,9 +70,16 @@ class SortingAggregatedTransform : public IProcessor
 public:
     SortingAggregatedTransform(size_t num_inputs, AggregatingTransformParamsPtr params);
     Status prepare() override;
+
 private:
     size_t num_inputs;
     AggregatingTransformParamsPtr params;
+    std::vector<Int32> last_bucket_number;
+    std::map<Int32, Chunk> chunks;
+    Chunk overflow_chunk;
+
+    bool tryPushChunk();
+    void addChunk(Chunk chunk);
 };
 
 /// Creates piece of pipeline which performs memory efficient merging of partially aggregated data from several sources.
